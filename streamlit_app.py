@@ -9,63 +9,62 @@ st.set_page_config(page_title="巴芒投资选股器", layout="wide", initial_si
 # 全局缓存：数据1小时更新一次
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_index_pe():
-    """获取三大指数实时PE（2026.5最新akshare接口）"""
+    """获取三大指数实时PE（东方财富稳定接口）"""
     try:
-        # 最新指数行情接口
-        df = ak.stock_zh_index_spot_sina()
-        # 匹配三大指数代码
-        hs300 = df[df["代码"] == "sh000300"]["市盈率"].values[0]
-        zz500 = df[df["代码"] == "sh000905"]["市盈率"].values[0]
-        cyb = df[df["代码"] == "sz399006"]["市盈率"].values[0]
+        # 官方指数估值接口（最稳定，2026年未变）
+        df = ak.stock_zh_index_valuation()
+        # 精确匹配三大指数
+        hs300 = df[df["指数代码"] == "000300.SH"]["市盈率"].values[0]
+        zz500 = df[df["指数代码"] == "000905.SH"]["市盈率"].values[0]
+        cyb = df[df["指数代码"] == "399006.SZ"]["市盈率"].values[0]
         return round(float(hs300), 2), round(float(zz500), 2), round(float(cyb), 2)
     except Exception as e:
-        st.error(f"指数估值获取失败：{str(e)[:60]}")
+        st.error(f"指数估值获取失败：{str(e)[:50]}")
         return None
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_list(roe_min=15, pe_max=25, dividend_min=2):
-    """按巴菲特策略动态筛选股票（2026.5最新财务接口）"""
+    """按巴菲特策略动态筛选股票（东方财富财务接口）"""
     try:
-        # 最新A股财务指标接口（替代废弃的业绩预告接口）
-        df = ak.stock_financial_indicator_ths(symbol="A股")
+        # 东方财富A股财务指标接口（稳定版）
+        df = ak.stock_financial_indicator_em(symbol="全部A股")
         
-        # 数据清洗：转换数值类型
-        df["净资产收益率"] = pd.to_numeric(df["净资产收益率"], errors="coerce")
-        df["市盈率"] = pd.to_numeric(df["市盈率"], errors="coerce")
-        df["股息率"] = pd.to_numeric(df["股息率"], errors="coerce")
-        df["资产负债率"] = pd.to_numeric(df["资产负债率"], errors="coerce")
+        # 强制转换数值类型，处理空值
+        numeric_cols = ["净资产收益率", "市盈率", "股息率", "资产负债率"]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
         
-        # 严格筛选
+        # 严格筛选逻辑
+        df = df.dropna(subset=numeric_cols)
         df = df[df["净资产收益率"] >= roe_min]
         df = df[df["市盈率"] <= pe_max]
         df = df[df["股息率"] >= dividend_min]
         df = df[df["资产负债率"] < 60]
         
-        # 剔除ST和新股
+        # 风险排除
         df = df[~df["股票名称"].str.contains("ST|*ST", na=False)]
-        df = df[df["上市日期"] < (datetime.now() - pd.Timedelta(days=1095)).strftime("%Y-%m-%d")]
+        df = df[df["上市天数"] > 1095]  # 上市超过3年
         
-        # 整理结果
+        # 整理输出
         result = df[["股票代码", "股票名称", "净资产收益率", "市盈率", "股息率", "资产负债率"]].head(20)
         result.columns = ["股票代码", "股票名称", "ROE(%)", "PE", "股息率(%)", "资产负债率(%)"]
         return result.reset_index(drop=True)
     except Exception as e:
-        st.error(f"选股数据获取失败：{str(e)[:60]}")
+        st.error(f"选股数据获取失败：{str(e)[:50]}")
         return None
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_m1_m2_data():
-    """获取M1-M2剪刀差（2026.5最新宏观接口）"""
+    """获取M1-M2剪刀差（央行官方数据接口）"""
     try:
-        # 最新货币供应量接口
-        m1_m2_df = ak.macro_china_money_supply_yearly()
+        # 央行货币供应量月度数据（稳定版）
+        m1_m2_df = ak.macro_china_money_supply()
         latest = m1_m2_df.iloc[0]
-        # 最新列名匹配
-        m1_growth = float(latest["M1同比增长"])
-        m2_growth = float(latest["M2同比增长"])
+        m1_growth = float(latest["M1同比"])
+        m2_growth = float(latest["M2同比"])
         return round(m1_growth - m2_growth, 2)
     except Exception as e:
-        st.error(f"宏观数据获取失败：{str(e)[:60]}")
+        st.error(f"宏观数据获取失败：{str(e)[:50]}")
         return None
 
 # 导航栏
@@ -83,12 +82,9 @@ if page == "首页":
     
     if index_data:
         col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(label="沪深300 PE", value=index_data[0])
-        with col2:
-            st.metric(label="中证500 PE", value=index_data[1])
-        with col3:
-            st.metric(label="创业板指 PE", value=index_data[2])
+        col1.metric("沪深300 PE", index_data[0])
+        col2.metric("中证500 PE", index_data[1])
+        col3.metric("创业板指 PE", index_data[2])
     else:
         st.warning("指数估值数据暂时不可用，请稍后刷新页面")
 
@@ -148,9 +144,9 @@ elif page == "数据说明":
     
     st.markdown("""
     ### 免费数据来源
-    ✅ 股票行情与估值：新浪财经（akshare 2026.5最新接口）
-    ✅ 财务数据：同花顺iFinD（akshare 2026.5最新接口）
-    ✅ 宏观数据：中国人民银行（akshare 2026.5最新接口）
+    ✅ 指数估值：东方财富网（akshare官方稳定接口）
+    ✅ 财务数据：东方财富iFinD（akshare官方稳定接口）
+    ✅ 宏观数据：中国人民银行（akshare官方稳定接口）
     
     ### 更新频率
     • 指数估值：每小时更新一次
