@@ -31,6 +31,10 @@ def get_financial_data(ticker):
             'avg_roe': info.get('returnOnEquity', 0),
             'avg_gross_margin': info.get('grossMargins', 0),
             'avg_net_margin': info.get('profitMargins', 0),
+            'debt_to_equity': info.get('debtToEquity', 0),
+            'current_ratio': info.get('currentRatio', 0),
+            'revenue_growth': info.get('revenueGrowth', 0),
+            'earnings_growth': info.get('earningsGrowth', 0),
         }
     except Exception as e:
         st.error(f"获取{ticker}数据失败: {e}")
@@ -134,10 +138,6 @@ def main():
                 
                 stock_info = get_financial_data(ticker)
                 if not stock_info:
-                    continue
-                
-                # 前置行业筛选
-                if allowed_sectors and not filter_by_industry(stock_info, allowed_sectors):
                     continue
                 
                 # 三层筛选
