@@ -1,6 +1,5 @@
 import streamlit as st
 import baostock as bs
-import efinance as ef
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -112,16 +111,29 @@ def get_stock_list(roe_min=15, pe_max=25, dividend_min=2):
         st.error(f"选股数据获取失败：{str(e)[:50]}")
         return None
 
-# -------------------------- 宏观数据（Efinance 稳定接口） --------------------------
+# -------------------------- 宏观数据（Baostock 稳定接口） --------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_m1_m2_data():
-    """获取M1-M2剪刀差，Efinance官方稳定接口"""
+    """获取M1-M2剪刀差，Baostock官方稳定接口"""
     try:
-        df = ef.macro.get_money_supply()
-        latest = df.iloc[0]
-        m1 = float(latest["M1同比增长"])
-        m2 = float(latest["M2同比增长"])
-        return round(m1 - m2, 2)
+        bs.login()
+        # 获取货币供应量数据
+        rs = bs.query_macro_data(
+            indicator_id="M0000001,M0000002",  # M1同比, M2同比
+            start_date=(datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d"),
+            end_date=datetime.now().strftime("%Y-%m-%d")
+        )
+        df = rs.get_data()
+        bs.logout()
+        
+        if not df.empty:
+            latest = df.iloc[0]
+            m1 = float(latest["M0000001"])
+            m2 = float(latest["M0000002"])
+            return round(m1 - m2, 2)
+        else:
+            st.error("宏观数据为空")
+            return None
     except Exception as e:
         st.error(f"宏观数据获取失败：{str(e)[:50]}")
         return None
@@ -171,7 +183,7 @@ elif page == "选股页面":
         
         if stocks is not None and not stocks.empty:
             st.success(f"筛选完成！找到 {len(stocks)} 只符合条件的股票")
-            st.dataframe(stocks, use_container_width=True)
+            st.dataframe(stocks, width="stretch")
         elif stocks is None:
             st.error("数据获取失败，请稍后重试")
         else:
@@ -204,7 +216,7 @@ elif page == "数据说明":
     ### 免费数据来源
     ✅ 指数估值：Baostock（上交所/深交所官方行情）
     ✅ 财务数据：Baostock（上市公司公开年报）
-    ✅ 宏观数据：Efinance（中国人民银行官方数据）
+    ✅ 宏观数据：Baostock（中国人民银行官方数据）
     
     ### 更新频率
     • 指数估值：每小时更新
