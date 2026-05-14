@@ -1,68 +1,140 @@
 import streamlit as st
-import akshare as ak
+import baostock as bs
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 页面配置
 st.set_page_config(page_title="巴芒投资选股器", layout="wide", initial_sidebar_state="expanded")
 
+# 全局初始化Baostock
+@st.cache_resource(show_spinner=False)
+def init_baostock():
+    """初始化Baostock连接，全局只执行一次"""
+    lg = bs.login()
+    return lg.error_code == '0'
+
 # 全局缓存：数据1小时更新一次
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_index_pe():
-    """获取三大指数实时PE（东方财富稳定接口）"""
+    """获取三大指数实时PE/PB（Baostock稳定接口）"""
+    if not init_baostock():
+        st.error("Baostock连接失败")
+        return None
+    
     try:
-        # 官方指数估值接口（最稳定，2026年未变）
-        df = ak.stock_zh_index_valuation()
-        # 精确匹配三大指数
-        hs300 = df[df["指数代码"] == "000300.SH"]["市盈率"].values[0]
-        zz500 = df[df["指数代码"] == "000905.SH"]["市盈率"].values[0]
-        cyb = df[df["指数代码"] == "399006.SZ"]["市盈率"].values[0]
-        return round(float(hs300), 2), round(float(zz500), 2), round(float(cyb), 2)
+        # 三大指数代码
+        indexes = {
+            "沪深300": "sh.000300",
+            "中证500": "sh.000905",
+            "创业板指": "sz.399006"
+        }
+        
+        result = []
+        for name, code in indexes.items():
+            # 获取最新交易日的估值数据
+            rs = bs.query_history_k_data_plus(
+                code,
+                "date,peTTM,pbMRQ",
+                start_date=(datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
+                end_date=datetime.now().strftime("%Y-%m-%d"),
+                frequency="d",
+                adjustflag="3"
+            )
+            df = rs.get_data()
+            if not df.empty:
+                latest = df.iloc[-1]
+                result.append(round(float(latest["peTTM"]), 2))
+        
+        if len(result) == 3:
+            return result[0], result[1], result[2]
+        else:
+            st.error("指数估值数据不完整")
+            return None
     except Exception as e:
         st.error(f"指数估值获取失败：{str(e)[:50]}")
         return None
+    finally:
+        bs.logout()
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_list(roe_min=15, pe_max=25, dividend_min=2):
-    """按巴菲特策略动态筛选股票（东方财富财务接口）"""
+    """按巴菲特策略动态筛选股票（Baostock财务接口）"""
+    if not init_baostock():
+        st.error("Baostock连接失败")
+        return None
+    
     try:
-        # 东方财富A股财务指标接口（稳定版）
-        df = ak.stock_financial_indicator_em(symbol="全部A股")
+        # 获取A股所有股票列表
+        stock_rs = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
+        stock_df = stock_rs.get_data()
+        # 只保留主板、创业板、科创板股票
+        stock_df = stock_df[stock_df["code"].str.startswith(("sh.", "sz."))]
+        stock_df = stock_df[~stock_df["code"].str.endswith((".BJ", ".HK"))]
         
-        # 强制转换数值类型，处理空值
-        numeric_cols = ["净资产收益率", "市盈率", "股息率", "资产负债率"]
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # 批量获取财务指标
+        result_list = []
+        for _, row in stock_df.head(500).iterrows():  # 限制数量避免超时
+            code = row["code"]
+            name = row["code_name"]
+            
+            # 跳过ST股
+            if "ST" in name or "*ST" in name:
+                continue
+            
+            # 获取最新财务数据
+            rs = bs.query_financial_indicator(
+                code,
+                year=datetime.now().year,
+                quarter=4,
+                fields="roeAvg,peTTM,dividend,liabilityToAsset,listDate"
+            )
+            df = rs.get_data()
+            
+            if not df.empty:
+                fin = df.iloc[0]
+                try:
+                    roe = float(fin["roeAvg"]) * 100  # 转换为百分比
+                    pe = float(fin["peTTM"])
+                    dividend = float(fin["dividend"]) * 100
+                    debt_ratio = float(fin["liabilityToAsset"]) * 100
+                    list_date = fin["listDate"]
+                    
+                    # 筛选条件
+                    if (roe >= roe_min and pe <= pe_max and dividend >= dividend_min 
+                        and debt_ratio < 60 and list_date < (datetime.now() - timedelta(days=1095)).strftime("%Y-%m-%d")):
+                        result_list.append({
+                            "股票代码": code,
+                            "股票名称": name,
+                            "ROE(%)": round(roe, 2),
+                            "PE": round(pe, 2),
+                            "股息率(%)": round(dividend, 2),
+                            "资产负债率(%)": round(debt_ratio, 2)
+                        })
+                except:
+                    continue
         
-        # 严格筛选逻辑
-        df = df.dropna(subset=numeric_cols)
-        df = df[df["净资产收益率"] >= roe_min]
-        df = df[df["市盈率"] <= pe_max]
-        df = df[df["股息率"] >= dividend_min]
-        df = df[df["资产负债率"] < 60]
-        
-        # 风险排除
-        df = df[~df["股票名称"].str.contains("ST|*ST", na=False)]
-        df = df[df["上市天数"] > 1095]  # 上市超过3年
-        
-        # 整理输出
-        result = df[["股票代码", "股票名称", "净资产收益率", "市盈率", "股息率", "资产负债率"]].head(20)
-        result.columns = ["股票代码", "股票名称", "ROE(%)", "PE", "股息率(%)", "资产负债率(%)"]
-        return result.reset_index(drop=True)
+        return pd.DataFrame(result_list).head(20)
     except Exception as e:
         st.error(f"选股数据获取失败：{str(e)[:50]}")
         return None
+    finally:
+        bs.logout()
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_m1_m2_data():
-    """获取M1-M2剪刀差（央行官方数据接口）"""
+    """获取M1-M2剪刀差（国家统计局官方数据）"""
     try:
-        # 央行货币供应量月度数据（稳定版）
-        m1_m2_df = ak.macro_china_money_supply()
-        latest = m1_m2_df.iloc[0]
-        m1_growth = float(latest["M1同比"])
-        m2_growth = float(latest["M2同比"])
-        return round(m1_growth - m2_growth, 2)
+        # 使用Baostock宏观数据接口
+        rs = bs.query_macro_money_supply()
+        df = rs.get_data()
+        if not df.empty:
+            latest = df.iloc[0]
+            m1_growth = float(latest["m1_yoy"])
+            m2_growth = float(latest["m2_yoy"])
+            return round(m1_growth - m2_growth, 2)
+        else:
+            st.error("宏观数据为空")
+            return None
     except Exception as e:
         st.error(f"宏观数据获取失败：{str(e)[:50]}")
         return None
@@ -107,7 +179,7 @@ elif page == "选股页面":
     dividend_threshold = st.sidebar.slider("最低股息率(%)", 1, 5, 2)
     
     if st.button("执行筛选"):
-        with st.spinner("正在从东方财富网拉取最新财务数据..."):
+        with st.spinner("正在从Baostock拉取最新财务数据..."):
             stocks = get_stock_list(roe_threshold, pe_threshold, dividend_threshold)
         
         if stocks is not None and not stocks.empty:
@@ -144,9 +216,9 @@ elif page == "数据说明":
     
     st.markdown("""
     ### 免费数据来源
-    ✅ 指数估值：东方财富网（akshare官方稳定接口）
-    ✅ 财务数据：东方财富iFinD（akshare官方稳定接口）
-    ✅ 宏观数据：中国人民银行（akshare官方稳定接口）
+    ✅ 指数估值：Baostock（上交所/深交所官方数据）
+    ✅ 财务数据：Baostock（上市公司公开财报）
+    ✅ 宏观数据：Baostock（中国人民银行/国家统计局）
     
     ### 更新频率
     • 指数估值：每小时更新一次
