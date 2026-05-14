@@ -9,9 +9,13 @@ st.set_page_config(page_title="巴芒投资选股器", layout="wide", initial_si
 # -------------------------- 指数估值（Baostock 稳定接口） --------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_index_pe():
-    """获取三大指数最新PE，自动跳过空值"""
+    """获取三大指数最新PE，严格处理空值"""
     try:
-        bs.login()
+        login_result = bs.login()
+        if login_result.error_code != '0':
+            st.error("Baostock登录失败")
+            return None
+        
         indexes = [
             ("沪深300", "sh.000300"),
             ("中证500", "sh.000905"),
@@ -20,60 +24,67 @@ def get_index_pe():
         
         pe_values = []
         for name, code in indexes:
-            # 获取近7天数据，自动找最新有效PE
+            # 获取近30天数据，确保能找到有效PE
             rs = bs.query_history_k_data_plus(
                 code,
                 "date,peTTM",
-                start_date=(datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
+                start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"),
                 end_date=datetime.now().strftime("%Y-%m-%d"),
                 frequency="d"
             )
             df = rs.get_data()
             
-            # 从后往前找第一个非空PE
+            # 从后往前找第一个非空且大于0的PE
+            valid_pe = None
             for i in range(len(df)-1, -1, -1):
                 pe_str = df.iloc[i]["peTTM"]
-                if pe_str and pe_str != '':
-                    pe_values.append(round(float(pe_str), 2))
+                if pe_str and pe_str.strip() != '' and float(pe_str) > 0:
+                    valid_pe = round(float(pe_str), 2)
                     break
+            
+            if valid_pe:
+                pe_values.append(valid_pe)
+            else:
+                st.warning(f"{name} PE数据暂时无法获取")
+                pe_values.append(None)
         
         bs.logout()
-        if len(pe_values) == 3:
-            return pe_values[0], pe_values[1], pe_values[2]
-        else:
-            st.error("部分指数估值数据缺失")
-            return None
+        return pe_values
     except Exception as e:
-        st.error(f"指数估值获取失败：{str(e)[:50]}")
+        st.error(f"指数估值获取失败：{str(e)[:60]}")
         return None
 
 # -------------------------- 选股数据（Baostock 财务接口） --------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_list(roe_min=15, pe_max=25, dividend_min=2):
-    """按巴菲特策略筛选股票，严格处理空值和异常"""
+    """按巴菲特策略筛选股票，修复正则表达式错误"""
     try:
-        bs.login()
+        login_result = bs.login()
+        if login_result.error_code != '0':
+            st.error("Baostock登录失败")
+            return None
+        
         # 获取所有A股列表
         rs = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
         stock_df = rs.get_data()
         
-        # 过滤有效股票
+        # 过滤有效股票（修复正则表达式：*需要转义）
         stock_df = stock_df[
             (stock_df["code"].str.startswith(("sh.", "sz."))) &
-            (~stock_df["code_name"].str.contains("ST|*ST", na=False)) &
+            (~stock_df["code_name"].str.contains(r"ST|\*ST", na=False)) &
             (stock_df["tradeStatus"] == "1")  # 仅交易中股票
         ]
         
         result = []
-        # 取前800只股票筛选（避免超时）
-        for _, row in stock_df.head(800).iterrows():
+        # 取前500只股票筛选（避免Streamlit超时）
+        for _, row in stock_df.head(500).iterrows():
             code = row["code"]
             name = row["code_name"]
             
-            # 获取最新年度财务数据
+            # 获取2024年完整年报数据（最准确）
             fin_rs = bs.query_financial_indicator(
                 code,
-                year=datetime.now().year-1,  # 用去年完整年报，数据最准
+                year=2024,
                 quarter=4,
                 fields="roeAvg,peTTM,dividend,liabilityToAsset,listDate"
             )
@@ -84,14 +95,14 @@ def get_stock_list(roe_min=15, pe_max=25, dividend_min=2):
                 
             fin = fin_df.iloc[0]
             try:
-                # 强制转换并处理空值
-                roe = float(fin["roeAvg"]) * 100 if fin["roeAvg"] else 0
-                pe = float(fin["peTTM"]) if fin["peTTM"] else 999
-                dividend = float(fin["dividend"]) * 100 if fin["dividend"] else 0
-                debt = float(fin["liabilityToAsset"]) * 100 if fin["liabilityToAsset"] else 100
+                # 强制转换并严格过滤空值和异常值
+                roe = float(fin["roeAvg"]) * 100 if fin["roeAvg"] and fin["roeAvg"].strip() != '' else 0
+                pe = float(fin["peTTM"]) if fin["peTTM"] and fin["peTTM"].strip() != '' else 9999
+                dividend = float(fin["dividend"]) * 100 if fin["dividend"] and fin["dividend"].strip() != '' else 0
+                debt = float(fin["liabilityToAsset"]) * 100 if fin["liabilityToAsset"] and fin["liabilityToAsset"].strip() != '' else 100
                 list_date = fin["listDate"]
                 
-                # 筛选条件
+                # 严格筛选条件
                 if (roe >= roe_min and pe <= pe_max and dividend >= dividend_min 
                     and debt < 60 and list_date < (datetime.now() - timedelta(days=1095)).strftime("%Y-%m-%d")):
                     result.append({
@@ -108,34 +119,36 @@ def get_stock_list(roe_min=15, pe_max=25, dividend_min=2):
         bs.logout()
         return pd.DataFrame(result).head(20)
     except Exception as e:
-        st.error(f"选股数据获取失败：{str(e)[:50]}")
+        st.error(f"选股数据获取失败：{str(e)[:60]}")
         return None
 
-# -------------------------- 宏观数据（Baostock 稳定接口） --------------------------
+# -------------------------- 宏观数据（友好提示+备用方案） --------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_m1_m2_data():
-    """获取M1-M2剪刀差，Baostock官方稳定接口"""
+    """获取M1-M2剪刀差，使用备用数据源"""
     try:
-        bs.login()
-        # 获取货币供应量数据
-        rs = bs.query_macro_data(
-            indicator_id="M0000001,M0000002",  # M1同比, M2同比
-            start_date=(datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d"),
-            end_date=datetime.now().strftime("%Y-%m-%d")
-        )
-        df = rs.get_data()
-        bs.logout()
-        
-        if not df.empty:
-            latest = df.iloc[0]
-            m1 = float(latest["M0000001"])
-            m2 = float(latest["M0000002"])
+        # 由于baostock无直接宏观接口，使用东方财富公开数据接口
+        import requests
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "reportName": "RPT_MONEY_SUPPLY",
+            "columns": "REPORT_DATE,M1_YOY,M2_YOY",
+            "pageSize": "1",
+            "pageNum": "1",
+            "sortTypes": "-1",
+            "sortColumns": "REPORT_DATE"
+        }
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if data["result"] and data["result"]["data"]:
+            latest = data["result"]["data"][0]
+            m1 = float(latest["M1_YOY"])
+            m2 = float(latest["M2_YOY"])
             return round(m1 - m2, 2)
         else:
-            st.error("宏观数据为空")
             return None
     except Exception as e:
-        st.error(f"宏观数据获取失败：{str(e)[:50]}")
+        st.error(f"宏观数据获取失败：{str(e)[:60]}")
         return None
 
 # -------------------------- 页面渲染 --------------------------
@@ -151,11 +164,20 @@ if page == "首页":
     with st.spinner("正在加载最新估值数据..."):
         index_data = get_index_pe()
     
-    if index_data:
+    if index_data and len(index_data) == 3:
         col1, col2, col3 = st.columns(3)
-        col1.metric("沪深300 PE", index_data[0])
-        col2.metric("中证500 PE", index_data[1])
-        col3.metric("创业板指 PE", index_data[2])
+        if index_data[0]:
+            col1.metric("沪深300 PE", index_data[0])
+        else:
+            col1.metric("沪深300 PE", "暂无数据")
+        if index_data[1]:
+            col2.metric("中证500 PE", index_data[1])
+        else:
+            col2.metric("中证500 PE", "暂无数据")
+        if index_data[2]:
+            col3.metric("创业板指 PE", index_data[2])
+        else:
+            col3.metric("创业板指 PE", "暂无数据")
     else:
         st.warning("指数估值数据暂时不可用，请稍后刷新")
 
@@ -215,12 +237,12 @@ elif page == "数据说明":
     st.markdown("""
     ### 免费数据来源
     ✅ 指数估值：Baostock（上交所/深交所官方行情）
-    ✅ 财务数据：Baostock（上市公司公开年报）
-    ✅ 宏观数据：Baostock（中国人民银行官方数据）
+    ✅ 财务数据：Baostock（上市公司2024年完整年报）
+    ✅ 宏观数据：东方财富网（中国人民银行官方数据）
     
     ### 更新频率
     • 指数估值：每小时更新
-    • 选股数据：每天更新（使用上一年完整年报）
+    • 选股数据：每天更新（使用2024年完整年报）
     • 宏观数据：每月更新
     
     ⚠️ 免责声明：本工具仅用于学习参考，不构成任何投资建议。
