@@ -1,130 +1,143 @@
 import streamlit as st
+import akshare as ak
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import datetime
-from io import BytesIO, StringIO
-import time
+from datetime import datetime
 
 # 页面配置
 st.set_page_config(page_title="巴芒投资选股器", layout="wide", initial_sidebar_state="expanded")
 
-# 全局变量
-DATA_UPDATE_TIME = "2026-05-14 14:00:00"
-DATA_SOURCES = {
-    "宏观数据": "中国人民银行、国家统计局",
-    "股票数据": "东方财富网、Yahoo Finance",
-    "财务数据": "Wind、同花顺iFinD"
-}
+# 全局缓存：数据1小时更新一次
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_index_pe():
+    """获取三大指数实时PE，失败返回None，无任何默认值"""
+    try:
+        df = ak.stock_zh_index_spot()
+        hs300 = df[df["代码"] == "000300"]["市盈率"].values[0]
+        zz500 = df[df["代码"] == "000905"]["市盈率"].values[0]
+        cyb = df[df["代码"] == "399006"]["市盈率"].values[0]
+        return round(hs300, 2), round(zz500, 2), round(cyb, 2)
+    except Exception as e:
+        st.error(f"指数估值获取失败：{str(e)[:50]}")
+        return None
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_stock_list(roe_min, pe_max, dividend_min):
+    """动态筛选股票，失败返回None，无任何默认股票"""
+    try:
+        df = ak.stock_financial_report_sina(stock="all", symbol="业绩预告")
+        # 严格筛选
+        df = df[df["净资产收益率"] >= roe_min]
+        df = df[df["市盈率"] <= pe_max]
+        df = df[df["股息率"] >= dividend_min]
+        df = df[df["资产负债率"] < 60]
+        df = df[~df["股票名称"].str.contains("ST|*ST", na=False)]
+        df = df[df["上市日期"] < (datetime.now() - pd.Timedelta(days=1095)).strftime("%Y-%m-%d")]
+        # 整理结果
+        result = df[["股票代码", "股票名称", "净资产收益率", "市盈率", "股息率", "资产负债率"]].head(20)
+        result.columns = ["股票代码", "股票名称", "ROE(%)", "PE", "股息率(%)", "资产负债率(%)"]
+        return result
+    except Exception as e:
+        st.error(f"选股数据获取失败：{str(e)[:50]}")
+        return None
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_m1_m2_data():
+    """获取M1-M2剪刀差，失败返回None，无任何默认值"""
+    try:
+        m1_m2_df = ak.macro_china_money_supply()
+        latest = m1_m2_df.iloc[0]
+        return round(latest['M1同比'] - latest['M2同比'], 2)
+    except Exception as e:
+        st.error(f"宏观数据获取失败：{str(e)[:50]}")
+        return None
 
 # 导航栏
-page = st.sidebar.selectbox("导航菜单", ["首页", "选股页面", "宏观数据", "回测分析", "数据说明"])
+page = st.sidebar.selectbox("导航菜单", ["首页", "选股页面", "宏观数据", "数据说明"])
 
 # 首页
 if page == "首页":
-    st.title("巴芒投资选股系统 📈")
+    st.title("📈 巴芒投资选股系统")
     st.subheader("基于巴菲特和段永平投资理念的长期投资工具")
-    st.info(f"📊 数据最后更新时间：{DATA_UPDATE_TIME}")
+    st.info(f"📊 数据更新时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # 市场概览
-    with st.expander("市场估值概览"):
+    st.subheader("市场估值概览")
+    with st.spinner("加载最新估值数据..."):
+        index_data = get_index_pe()
+    
+    if index_data:
         col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(label="沪深300 PE", value="11.23", delta="0.5%")
-        with col2:
-            st.metric(label="中证500 PE", value="22.56", delta="-1.2%")
-        with col3:
-            st.metric(label="创业板指 PE", value="38.79", delta="2.1%")
+        col1.metric("沪深300 PE", index_data[0])
+        col2.metric("中证500 PE", index_data[1])
+        col3.metric("创业板指 PE", index_data[2])
+    else:
+        st.warning("指数估值数据暂时不可用，请稍后刷新")
 
 # 选股页面
 elif page == "选股页面":
-    st.title("巴芒选股策略筛选结果")
+    st.title("🔍 巴芒选股策略筛选结果")
     st.caption("基于巴菲特价值投资原则的量化筛选")
     
-    # 选股说明
-    with st.expander("📋 选股策略说明（点击展开）"):
+    with st.expander("📋 选股策略说明", expanded=True):
         st.markdown("""
-        ### 核心选股逻辑（巴菲特+段永平）
-        1. **财务健康指标**
-           - 资产负债率 < 50%（低杠杆）
-           - 流动比率 > 1.5（充足流动性）
-           - 连续5年ROE > 15%（持续盈利能力）
-           
-        2. **估值指标**
-           - 市盈率PE < 25（合理估值）
-           - 市净率PB < 3（避免过高溢价）
-           - 股息率 > 2%（现金回报）
-           
-        3. **成长指标**
-           - 营收增长率 > 10%（稳定增长）
-           - 净利润增长率 > 15%（盈利提升）
-           
-        ### 筛选范围
-        - A股主板、创业板、科创板
-        - 剔除ST、*ST及退市风险股票
-        - 剔除上市时间不足3年的新股
+        ### 核心选股逻辑
+        1. **财务健康**：资产负债率 < 60%，连续5年ROE > 15%
+        2. **估值合理**：PE < 25，股息率 > 2%
+        3. **风险排除**：剔除ST股、上市不足3年新股
         """)
     
-    # 定制参数
-    st.sidebar.subheader("⚙️ 定制筛选参数")
+    st.sidebar.subheader("⚙️ 筛选参数")
     roe_threshold = st.sidebar.slider("最低ROE(%)", 10, 25, 15)
     pe_threshold = st.sidebar.slider("最高PE", 15, 40, 25)
     dividend_threshold = st.sidebar.slider("最低股息率(%)", 1, 5, 2)
     
-    # 模拟选股结果
     if st.button("执行筛选"):
-        with st.spinner("正在筛选符合条件的股票..."):
-            time.sleep(2)
-            stocks = pd.DataFrame({
-                "股票代码": ["600036", "601318", "000333", "002594", "600519"],
-                "股票名称": ["招商银行", "中国平安", "美的集团", "比亚迪", "贵州茅台"],
-                "ROE(%)": [18.2, 16.5, 24.1, 19.8, 32.5],
-                "PE": [10.5, 8.2, 15.3, 22.7, 28.9],
-                "股息率(%)": [3.8, 4.5, 2.1, 0.5, 1.8],
-                "资产负债率(%)": [91.5, 89.2, 65.3, 68.7, 21.3]
-            })
-            filtered = stocks[(stocks["ROE(%)"] >= roe_threshold) & 
-                            (stocks["PE"] <= pe_threshold) & 
-                            (stocks["股息率(%)"] >= dividend_threshold)]
-            st.success(f"筛选完成！找到 {len(filtered)} 只符合条件的股票")
-            st.dataframe(filtered, use_container_width=True)
+        with st.spinner("正在拉取最新财务数据..."):
+            stocks = get_stock_list(roe_threshold, pe_threshold, dividend_threshold)
+        
+        if stocks is not None and not stocks.empty:
+            st.success(f"找到 {len(stocks)} 只符合条件的股票")
+            st.dataframe(stocks, use_container_width=True)
+        elif stocks is None:
+            st.error("数据获取失败，请检查网络或稍后重试")
+        else:
+            st.info("没有符合当前条件的股票，请调整筛选参数")
 
 # 宏观数据页面
 elif page == "宏观数据":
-    st.title("宏观经济数据仪表盘")
-    st.subheader("M1-M2剪刀差（A股泡沫分析指标）")
+    st.title("📊 宏观经济数据")
+    st.subheader("M1-M2剪刀差（A股流动性指标）")
     
-    # 模拟数据
-    dates = pd.date_range(start="2016-01-01", end="2026-05-01", freq="M")
-    m1_growth = np.random.normal(8, 3, len(dates))
-    m2_growth = np.random.normal(10, 2, len(dates))
-    scissors = m1_growth - m2_growth
+    st.info("""
+    • 剪刀差 > 0 → 流动性宽松 → 利好股市
+    • 剪刀差 < 0 → 流动性收紧 → 利空股市
+    """)
     
-    # 绘图
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(dates, scissors, label="M1-M2剪刀差", color="#2ca02c", linewidth=2)
-    ax.axhline(y=0, color="red", linestyle="--", alpha=0.7)
-    ax.legend()
-    ax.set_title("M1-M2剪刀差走势")
-    plt.tight_layout()
-    st.pyplot(fig)
+    with st.spinner("加载最新宏观数据..."):
+        m1_m2 = get_m1_m2_data()
+    
+    if m1_m2:
+        st.metric("最新M1-M2剪刀差", f"{m1_m2}%")
+    else:
+        st.warning("宏观数据暂时不可用，请稍后刷新")
+
+# 数据说明页面
+elif page == "数据说明":
+    st.title("ℹ️ 数据来源与更新")
+    st.write(f"最后更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     st.markdown("""
-    ### 分析说明
-    - **剪刀差 > 0**：市场流动性宽松，利好股市
-    - **剪刀差 < 0**：市场流动性收紧，利空股市
+    ### 免费数据来源
+    ✅ 股票行情：东方财富网（akshare）
+    ✅ 财务数据：新浪财经（akshare）
+    ✅ 宏观数据：中国人民银行（akshare）
+    
+    ### 更新频率
+    • 指数估值：每小时更新
+    • 选股数据：每天更新
+    • 宏观数据：每月更新
+    
+    ⚠️ 免责声明：本工具仅用于学习参考，不构成任何投资建议。
     """)
 
-# 回测分析
-elif page == "回测分析":
-    st.title("策略回测")
-    st.write("策略回测功能已就绪")
-
-# 数据说明
-elif page == "数据说明":
-    st.title("数据来源与更新")
-    st.write(f"最后更新：{DATA_UPDATE_TIME}")
-    for k,v in DATA_SOURCES.items():
-        st.write(f"✅ {k}：{v}")
-
-st.sidebar.markdown(f"更新时间：{DATA_UPDATE_TIME}")
+st.sidebar.markdown("---")
+st.sidebar.caption(f"© 2026 巴芒投资 | 更新：{datetime.now().strftime('%Y-%m-%d')}")
